@@ -18,8 +18,12 @@ class SandboxEnvironment:
     def __init__(self, db_path: Optional[Path] = None):
         self.db_path = db_path or DEFAULT_DB_PATH
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        new_database = not self.db_path.exists()
         self.conn: Optional[sqlite3.Connection] = None
         self._init_db()
+        if new_database:
+            with self.get_connection():
+                self._seed_default_data()
 
     def get_connection(self) -> sqlite3.Connection:
         if self.conn is None:
@@ -97,14 +101,13 @@ class SandboxEnvironment:
         """Resets the entire sandbox to pristine seed data."""
         conn = self.get_connection()
         cursor = conn.cursor()
-        cursor.execute("DELETE FROM tickets")
-        cursor.execute("DELETE FROM customers")
-        cursor.execute("DELETE FROM knowledge_base")
-        cursor.execute("DELETE FROM executed_actions")
-        cursor.execute("DELETE FROM drafts")
-        conn.commit()
-
-        self._seed_default_data()
+        with conn:
+            cursor.execute("DELETE FROM tickets")
+            cursor.execute("DELETE FROM customers")
+            cursor.execute("DELETE FROM knowledge_base")
+            cursor.execute("DELETE FROM executed_actions")
+            cursor.execute("DELETE FROM drafts")
+            self._seed_default_data()
 
     def _seed_default_data(self):
         conn = self.get_connection()
@@ -230,9 +233,14 @@ class SandboxEnvironment:
             sample_tickets
         )
 
-        conn.commit()
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
 
     def close(self):
         if self.conn:
             self.conn.close()
             self.conn = None
+

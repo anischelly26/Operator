@@ -8,14 +8,16 @@ Implements 6 tools (3 read, 3 write) with:
 - Policy enforcement and human checkpoint integration
 """
 
+import copy
 import json
 import sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from pydantic import ValidationError
 
 from agent.models import (
+    ACTION_PAYLOAD_MODELS,
     CheckCustomerArgs,
     DraftReplyArgs,
     ExecuteActionArgs,
@@ -29,10 +31,11 @@ from sandbox.environment import SandboxEnvironment
 
 
 class ToolRegistry:
-    def __init__(self, sandbox: SandboxEnvironment, checkpoint_handler: Optional[Callable] = None):
+    def __init__(self, sandbox: SandboxEnvironment, checkpoint_handler: Optional[Callable] = None, ticket_scope: Optional[str] = None):
         self.sandbox = sandbox
         self.checkpoint_handler = checkpoint_handler
         self.call_logs: List[ToolResult] = []
+        self.ticket_scope = ticket_scope
 
     def get_schemas(self) -> List[Dict[str, Any]]:
         """Returns OpenAI-compatible function calling schemas."""
@@ -94,38 +97,49 @@ class ToolRegistry:
         start_time = time.perf_counter()
         name = tool_call.name
         args = tool_call.arguments
-        now_iso = datetime.utcnow().isoformat() + "Z"
+        now_iso = datetime.now(timezone.utc).isoformat()
 
         # Dispatch with error boundary
         try:
+            if self.ticket_scope:
+                if "ticket_id" in args and args["ticket_id"] != self.ticket_scope:
+                    raise PermissionError("Tool call targets a ticket outside the current task.")
+                if name == "check_customer_status":
+                    account = self.sandbox.get_connection().execute(
+                        "SELECT c.customer_id, c.email FROM tickets t JOIN customers c "
+                        "ON c.customer_id = t.customer_id WHERE t.ticket_id = ?", (self.ticket_scope,),
+                    ).fetchone()
+                    if account is None or args.get("customer_id") not in {account["customer_id"], account["email"]}:
+                        raise PermissionError("Customer lookup falls outside the current ticket.")
             if name == "get_ticket":
                 validated = GetTicketArgs(**args)
                 output = self._get_ticket(validated)
-                is_error = "Error:" in output
+                is_error = output.startswith("Error:")
                 err_type = "EmptyResultError" if is_error else None
 
             elif name == "search_knowledge_base":
                 validated = SearchKBArgs(**args)
                 output = self._search_kb(validated)
-                is_error = "Error:" in output
+                is_error = output.startswith("Error:")
                 err_type = "EmptyResultError" if is_error else None
 
             elif name == "check_customer_status":
                 validated = CheckCustomerArgs(**args)
                 output = self._check_customer(validated)
-                is_error = "Error:" in output
+                is_error = output.startswith("Error:")
                 err_type = "EmptyResultError" if is_error else None
 
             elif name == "update_ticket_status":
                 validated = UpdateStatusArgs(**args)
                 output = self._update_ticket_status(validated)
-                is_error = "Error:" in output or "DENIED" in output
-                err_type = "UserRejectionError" if "DENIED" in output else ("WrongToolError" if is_error else None)
+                denied = output.startswith("Human Checkpoint DENIED")
+                is_error = output.startswith("Error:") or denied
+                err_type = "UserRejectionError" if denied else ("WrongToolError" if is_error else None)
 
             elif name == "draft_reply":
                 validated = DraftReplyArgs(**args)
                 output = self._draft_reply(validated)
-                is_error = "Error:" in output
+                is_error = output.startswith("Error:")
                 err_type = "WrongToolError" if is_error else None
 
             elif name == "execute_action":
@@ -136,6 +150,11 @@ class ToolRegistry:
                 output = f"Error: Unknown tool '{name}'. Available tools: get_ticket, search_knowledge_base, check_customer_status, update_ticket_status, draft_reply, execute_action."
                 is_error = True
                 err_type = "WrongToolError"
+
+        except PermissionError as error:
+            output = f"Security policy violation: {error}"
+            is_error = True
+            err_type = "ScopeViolationError"
 
         except ValidationError as ve:
             # Format validation error cleanly for LLM consumption
@@ -176,18 +195,11 @@ class ToolRegistry:
         if not row:
             return f"Error: Ticket '{args.ticket_id}' not found in database. Please verify the ticket ID."
 
-        # Notice: Encapsulate untrusted user-submitted ticket body safely
-        return (
-            f"Ticket ID: {row['ticket_id']}\n"
-            f"Customer ID: {row['customer_id']}\n"
-            f"Sender: {row['sender_email']}\n"
-            f"Subject: {row['subject']}\n"
-            f"Status: {row['status']}\n"
-            f"Tags: {row['tags']}\n"
-            f"<UNTRUSTED_CUSTOMER_INPUT>\n"
-            f"{row['body']}\n"
-            f"</UNTRUSTED_CUSTOMER_INPUT>"
-        )
+        # JSON escaping prevents customer text from forging observation headers.
+        record = dict(row)
+        record["tags"] = json.loads(record["tags"])
+        record["untrusted_fields"] = ["subject", "body", "sender_email"]
+        return json.dumps(record)
 
     def _search_kb(self, args: SearchKBArgs) -> str:
         conn = self.sandbox.get_connection()
@@ -218,16 +230,9 @@ class ToolRegistry:
         if not row:
             return f"Error: Customer record '{args.customer_id}' not found."
 
-        orders = json.loads(row["orders"])
-        orders_str = "\n".join([f"  - Order {o['order_id']}: {o['item']} (${o['amount']}) Status: {o['status']}" for o in orders])
-        return (
-            f"Customer ID: {row['customer_id']}\n"
-            f"Name: {row['name']}\n"
-            f"Email: {row['email']}\n"
-            f"Plan: {row['plan']}\n"
-            f"Account Balance: ${row['balance']:.2f}\n"
-            f"Orders:\n{orders_str if orders_str else '  No orders on record.'}"
-        )
+        record = dict(row)
+        record["orders"] = json.loads(record["orders"])
+        return json.dumps(record)
 
     def _update_ticket_status(self, args: UpdateStatusArgs) -> str:
         conn = self.sandbox.get_connection()
@@ -248,18 +253,17 @@ class ToolRegistry:
                 f"with tags {list(existing_tags)}. No database modification performed."
             )
 
-        # Human Checkpoint Approval Gate
         if self.checkpoint_handler:
             approved, reason = self.checkpoint_handler(
                 ticket_id=args.ticket_id,
                 action_type=f"UPDATE_STATUS_TO_{args.status}",
-                payload={"new_status": args.status, "tags": list(new_tags)},
+                payload={"new_status": args.status, "tags": sorted(new_tags)},
                 idempotency_key=f"{args.ticket_id}-STATUS-{args.status}",
             )
-            if not approved:
+            if approved is not True:
                 return f"Human Checkpoint DENIED status update for ticket '{args.ticket_id}'. Reason: {reason}."
 
-        merged_tags = list(existing_tags.union(new_tags))
+        merged_tags = sorted(existing_tags.union(new_tags))
         cursor.execute(
             "UPDATE tickets SET status = ?, tags = ?, updated_at = CURRENT_TIMESTAMP WHERE ticket_id = ?",
             (args.status, json.dumps(merged_tags), args.ticket_id),
@@ -274,120 +278,140 @@ class ToolRegistry:
         if not cursor.fetchone():
             return f"Error: Cannot draft reply for non-existent ticket '{args.ticket_id}'."
 
-        cursor.execute(
-            "INSERT INTO drafts (ticket_id, recipient, subject, body) VALUES (?, ?, ?, ?)",
-            (args.ticket_id, args.recipient, args.subject, args.body),
-        )
-        conn.commit()
+        values = (args.ticket_id, args.recipient, args.subject, args.body)
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT draft_id FROM drafts WHERE ticket_id = ? AND recipient = ? AND subject = ? AND body = ?",
+                values,
+            ).fetchone()
+            if existing:
+                return f"Idempotent draft: Existing reply retained for ticket '{args.ticket_id}'."
+            conn.execute(
+                "INSERT INTO drafts (ticket_id, recipient, subject, body) VALUES (?, ?, ?, ?)", values,
+            )
         return f"Success: Draft reply saved for ticket '{args.ticket_id}' to recipient '{args.recipient}'."
 
+    def _action_policy(self, args: ExecuteActionArgs, customer) -> Optional[Tuple[str, bool, str]]:
+        """Enforce policy against account data, independently of model reasoning."""
+        if args.action_type == "ISSUE_REFUND" and args.payload["amount"] > 150.0:
+            return (
+                f"Policy violation: Requested refund of ${args.payload['amount']:.2f} exceeds operator limit of $150.00. "
+                "Action blocked. Please escalate ticket to a supervisor instead.",
+                True, "PolicyViolationError",
+            )
+        if args.action_type in {"RESET_PASSWORD", "SEND_EMAIL"}:
+            key = "target_email" if args.action_type == "RESET_PASSWORD" else "recipient"
+            if args.payload[key].casefold() != customer["email"].strip().casefold():
+                return (
+                    "Security policy violation: Recipient must match the registered account email. Action blocked.",
+                    True, "SecurityViolationError",
+                )
+        if args.action_type == "CANCEL_ORDER":
+            order = next(
+                (o for o in json.loads(customer["orders"]) if o["order_id"] == args.payload["order_id"]),
+                None,
+            )
+            if order is None:
+                return "Policy violation: Order does not belong to the ticket customer.", True, "PolicyViolationError"
+            if order["status"] not in {"PENDING", "PROCESSING"}:
+                return "Policy violation: Only PENDING or PROCESSING orders can be cancelled.", True, "PolicyViolationError"
+        return None
+
     def _execute_action(self, args: ExecuteActionArgs) -> Tuple[str, bool, Optional[str]]:
+        # Action-specific validation also rejects missing fields, extra keys,
+        # booleans, numeric strings and non-finite refund amounts.
+        payload_model = ACTION_PAYLOAD_MODELS[args.action_type]
+        args = args.model_copy(update={"payload": payload_model(**args.payload).model_dump(exclude_none=True)})
         conn = self.sandbox.get_connection()
-        cursor = conn.cursor()
+        serialized_payload = json.dumps(args.payload, sort_keys=True, allow_nan=False)
 
-        # 1. Idempotency Check
-        cursor.execute(
-            "SELECT action_type, executed_at FROM executed_actions WHERE idempotency_key = ?",
-            (args.idempotency_key,),
+        def existing_result():
+            row = conn.execute(
+                "SELECT ticket_id, action_type, payload, executed_at FROM executed_actions WHERE idempotency_key = ?",
+                (args.idempotency_key,),
+            ).fetchone()
+            if row is None:
+                return None
+            if (row["ticket_id"] != args.ticket_id or row["action_type"] != args.action_type
+                    or json.loads(row["payload"]) != args.payload):
+                return (
+                    "Idempotency conflict: Key already belongs to a different ticket, action or payload.",
+                    True, "IdempotencyConflictError",
+                )
+            return (
+                f"Idempotency Guard: Action with key '{args.idempotency_key}' ({row['action_type']}) "
+                f"was already executed at {row['executed_at']}. Duplicate execution blocked safely.",
+                False, None,
+            )
+
+        def account():
+            return conn.execute(
+                "SELECT c.customer_id, c.email, c.orders FROM tickets t "
+                "JOIN customers c ON c.customer_id = t.customer_id WHERE t.ticket_id = ?",
+                (args.ticket_id,),
+            ).fetchone()
+
+        prior = existing_result()
+        if prior is not None:
+            return prior
+        customer = account()
+        if customer is None:
+            return "Error: Ticket or registered customer not found.", True, "EmptyResultError"
+        violation = self._action_policy(args, customer)
+        if violation is not None:
+            return violation
+
+        # No handler means no approval. Never silently bypass the checkpoint.
+        if self.checkpoint_handler is None:
+            return "Human Checkpoint DENIED: No approval handler configured.", True, "UserRejectionError"
+        approved, reason = self.checkpoint_handler(
+            ticket_id=args.ticket_id,
+            action_type=args.action_type,
+            payload=copy.deepcopy(args.payload),
+            idempotency_key=args.idempotency_key,
         )
-        existing = cursor.fetchone()
-        if existing:
+        if approved is not True:
             return (
-                f"Idempotency Guard: Action with key '{args.idempotency_key}' ({existing['action_type']}) "
-                f"was already executed at {existing['executed_at']}. Duplicate execution blocked safely.",
-                False,
-                None,
+                f"Human Checkpoint DENIED action '{args.action_type}' for ticket '{args.ticket_id}'. "
+                f"Reason given: {reason}. Action aborted.",
+                True, "UserRejectionError",
             )
 
-        # 2. Policy Enforcement Guardrails
-        if args.action_type == "ISSUE_REFUND":
-            amount = float(args.payload.get("amount", 0.0))
-            if amount <= 0:
-                return "Policy error: Refund amount must be greater than $0.00.", True, "BadArgumentsError"
-            if amount > 150.0:
-                return (
-                    f"Policy violation: Requested refund of ${amount:.2f} exceeds operator limit of $150.00. "
-                    "Action blocked. Please escalate ticket to a supervisor instead.",
-                    True,
-                    "PolicyViolationError",
-                )
-
-        if args.action_type == "RESET_PASSWORD":
-            target_email = args.payload.get("target_email")
-            cursor.execute("SELECT sender_email FROM tickets WHERE ticket_id = ?", (args.ticket_id,))
-            t_row = cursor.fetchone()
-            if not t_row:
-                return f"Error: Ticket '{args.ticket_id}' not found.", True, "EmptyResultError"
-            verified_email = t_row["sender_email"]
-            if target_email and target_email.lower().strip() != verified_email.lower().strip():
-                return (
-                    f"Security policy violation: Cannot send password reset to '{target_email}'. "
-                    f"Must match registered account email '{verified_email}'. Action blocked.",
-                    True,
-                    "SecurityViolationError",
-                )
-
-        # 3. Human Checkpoint Approval Gate
-        if self.checkpoint_handler:
-            approved, reason = self.checkpoint_handler(
-                ticket_id=args.ticket_id,
-                action_type=args.action_type,
-                payload=args.payload,
-                idempotency_key=args.idempotency_key,
-            )
-            if not approved:
-                return (
-                    f"Human Checkpoint DENIED action '{args.action_type}' for ticket '{args.ticket_id}'. "
-                    f"Reason given: {reason}. Action aborted.",
-                    True,
-                    "UserRejectionError",
-                )
-
-        # 4. Commit Action to Database
-        try:
-            cursor.execute(
+        # Serialize writers and recheck after approval: both the action record and
+        # domain mutation commit together, or both roll back on any exception.
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            prior = existing_result()
+            if prior is not None:
+                return prior
+            customer = account()
+            if customer is None:
+                return "Error: Ticket or registered customer not found.", True, "EmptyResultError"
+            violation = self._action_policy(args, customer)
+            if violation is not None:
+                return violation
+            conn.execute(
                 "INSERT INTO executed_actions (idempotency_key, ticket_id, action_type, payload) VALUES (?, ?, ?, ?)",
-                (args.idempotency_key, args.ticket_id, args.action_type, json.dumps(args.payload)),
+                (args.idempotency_key, args.ticket_id, args.action_type, serialized_payload),
             )
-
-            # Apply domain side effects in sandbox
             if args.action_type == "CANCEL_ORDER":
-                order_id = args.payload.get("order_id")
-                cursor.execute("SELECT customer_id, orders FROM customers")
-                for c_row in cursor.fetchall():
-                    orders = json.loads(c_row["orders"])
-                    updated = False
-                    for ord_item in orders:
-                        if ord_item["order_id"] == order_id:
-                            ord_item["status"] = "CANCELLED"
-                            updated = True
-                    if updated:
-                        cursor.execute(
-                            "UPDATE customers SET orders = ? WHERE customer_id = ?",
-                            (json.dumps(orders), c_row["customer_id"]),
-                        )
-
+                orders = json.loads(customer["orders"])
+                for order in orders:
+                    if order["order_id"] == args.payload["order_id"]:
+                        order["status"] = "CANCELLED"
+                conn.execute(
+                    "UPDATE customers SET orders = ? WHERE customer_id = ?",
+                    (json.dumps(orders), customer["customer_id"]),
+                )
             elif args.action_type == "ISSUE_REFUND":
-                amount = float(args.payload.get("amount", 0.0))
-                # Update customer balance/records
-                cursor.execute("SELECT customer_id FROM tickets WHERE ticket_id = ?", (args.ticket_id,))
-                t_row = cursor.fetchone()
-                if t_row:
-                    cursor.execute(
-                        "UPDATE customers SET balance = balance + ? WHERE customer_id = ?",
-                        (amount, t_row["customer_id"]),
-                    )
+                conn.execute(
+                    "UPDATE customers SET balance = balance + ? WHERE customer_id = ?",
+                    (args.payload["amount"], customer["customer_id"]),
+                )
+        return (
+            f"Success: Action '{args.action_type}' committed in sandbox with idempotency_key '{args.idempotency_key}'. "
+            f"Details: {args.payload}",
+            False, None,
+        )
 
-            conn.commit()
-            return (
-                f"Success: Action '{args.action_type}' committed in sandbox with idempotency_key '{args.idempotency_key}'. "
-                f"Details: {args.payload}",
-                False,
-                None,
-            )
-        except sqlite3.IntegrityError:
-            return (
-                f"Idempotency Guard: Database unique constraint prevented duplicate action '{args.idempotency_key}'.",
-                False,
-                None,
-            )

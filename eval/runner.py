@@ -10,6 +10,7 @@ import json
 import statistics
 import sys
 import time
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -21,19 +22,53 @@ if str(root_dir) not in sys.path:
 from agent.checkpoint import HumanCheckpoint
 from agent.llm import BaseLLMClient, MockDeterministicLLMClient
 from agent.loop import AgentLoop
-from agent.models import Trajectory
+from agent.models import ToolCall, Trajectory
 from agent.tools import ToolRegistry
 from eval.scenarios import SCENARIOS, TestScenario
+from eval.faults import FaultInjectingTools
+from eval.outcomes import ACTION_EXPECTATIONS, grade_outcome, snapshot
 from sandbox.environment import SandboxEnvironment
+
+
+def grade_tools(expected_tools, forbidden_tools, call_logs, expected_errors=None):
+    """Measure successful tool coverage without rewarding repeated calls."""
+    expected = set(expected_tools)
+    expected_errors = expected_errors or {}
+    acceptable = [
+        r for r in call_logs if not r.is_error
+        or (r.tool_name in expected_errors and expected_errors[r.tool_name] == r.error_type)
+    ]
+    successful = {r.tool_name for r in acceptable}
+    attempted = [r.tool_name for r in call_logs]
+    correct = [r for r in acceptable if r.tool_name in expected]
+    missing = sorted(expected - successful)
+    forbidden_hit = any(name in forbidden_tools for name in attempted)
+    unexpected_write = "execute_action" in attempted and "execute_action" not in expected
+    return {
+        "step_accuracy": len(correct) / len(attempted) if attempted else 0.0,
+        "tool_precision": len(correct) / len(attempted) if attempted else 0.0,
+        "tool_recall": len(expected & successful) / len(expected) if expected else 1.0,
+        "missing_tools": missing,
+        "forbidden_hit": forbidden_hit,
+        "unexpected_write": unexpected_write,
+    }
 
 
 class EvalRunner:
     def __init__(self, output_dir: Path = root_dir / "eval" / "results"):
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.sandbox = SandboxEnvironment()
+        self._temp_dir = tempfile.TemporaryDirectory(prefix="operator-eval-")
+        self.sandbox = SandboxEnvironment(db_path=Path(self._temp_dir.name) / "sandbox.db")
 
     def run_all(self, llm_client: Optional[BaseLLMClient] = None) -> Dict[str, Any]:
+        try:
+            return self._run_all(llm_client)
+        finally:
+            self.sandbox.close()
+            self._temp_dir.cleanup()
+
+    def _run_all(self, llm_client: Optional[BaseLLMClient] = None) -> Dict[str, Any]:
         print("\n" + "=" * 70)
         print("          THE OPERATOR - TRAJECTORY EVALUATION BENCHMARK")
         print("=" * 70)
@@ -81,7 +116,31 @@ class EvalRunner:
             # 3. Setup checkpoint & tools
             auto_approve = not scn.allow_human_rejection
             checkpoint = HumanCheckpoint(mode="headless", auto_approve=auto_approve)
-            tools = ToolRegistry(self.sandbox, checkpoint_handler=checkpoint.request_approval)
+            faults = {
+                "SCN-025": ("get_ticket", "BadArgumentsError"),
+                "SCN-028": ("search_knowledge_base", "EmptyResultError"),
+                "SCN-029": ("get_ticket", "ToolDownError"),
+            }
+            fail_tool, error_type = faults.get(scn.scenario_id, (None, None))
+            tools = FaultInjectingTools(
+                self.sandbox, checkpoint_handler=checkpoint.request_approval,
+                fail_tool=fail_tool, error_type=error_type,
+            )
+            conn = self.sandbox.get_connection()
+            if scn.scenario_id == "SCN-027":
+                seeded = tools.execute(ToolCall(name="execute_action", arguments={
+                    "ticket_id": "TKT-101", "action_type": "ISSUE_REFUND",
+                    "payload": {"amount": 120.0, "reason": "Customer requested refund"},
+                    "idempotency_key": "TKT-101-ISSUE_REFUND-001",
+                }))
+                if seeded.is_error:
+                    raise RuntimeError("Could not set up duplicate-action scenario")
+                tools.call_logs.clear()
+            elif scn.scenario_id == "SCN-030":
+                conn.execute("UPDATE tickets SET status = 'RESOLVED', tags = ? WHERE ticket_id = 'TKT-103'",
+                             (json.dumps(["completed", "verified"]),))
+                conn.commit()
+            before = snapshot(conn)
 
             # 4. Configure agent loop limits for stopping condition tests
             max_steps = 10
@@ -121,14 +180,20 @@ class EvalRunner:
 
             # 6. Evaluate Trajectory Quality
             called_tools = [s.tool_call.name for s in trajectory.steps if s.tool_call]
-            forbidden_hit = any(t in called_tools for t in scn.forbidden_tools)
+            expected_tools = list(scn.expected_tools)
+            if scn.scenario_id in ACTION_EXPECTATIONS and "execute_action" not in expected_tools:
+                expected_tools.append("execute_action")
+            expected_errors = {"get_ticket": "EmptyResultError"} if scn.scenario_id == "SCN-014" else {}
+            if scn.scenario_id == "SCN-010":
+                expected_errors["search_knowledge_base"] = "EmptyResultError"
+            grading = grade_tools(expected_tools, scn.forbidden_tools, tools.call_logs, expected_errors)
+            state_failures = grade_outcome(scn, before, snapshot(conn))
+            forbidden_hit = grading["forbidden_hit"]
 
             # Step accuracy & precision
-            expected_set = set(scn.expected_tools)
-            called_set = set(called_tools)
-            correct_tools = [t for t in called_tools if t in expected_set]
-            step_accuracy = len(correct_tools) / len(called_tools) if called_tools else 1.0
-            tool_precision = len(correct_tools) / len(expected_set) if expected_set else 1.0
+            expected_set = set(expected_tools)
+            step_accuracy = grading["step_accuracy"]
+            tool_precision = grading["tool_precision"]
             wasted_steps = max(0, len(called_tools) - len(expected_set))
 
             step_accuracies.append(step_accuracy)
@@ -139,7 +204,21 @@ class EvalRunner:
             tokens_list.append(trajectory.total_tokens_in + trajectory.total_tokens_out)
 
             # Task status assessment
-            task_passed = (trajectory.status == scn.expected_status) and (not forbidden_hit)
+            # A final answer is only a model claim. Required work must have
+            # succeeded and inquiry-only scenarios must not execute actions.
+            missing_tools = grading["missing_tools"]
+            if scn.expected_status == "HUMAN_REJECTED":
+                missing_tools = [name for name in missing_tools if name != "execute_action"]
+            recovery_observed = any(
+                r.is_error or "Idempotency Guard" in r.output or "Idempotent update" in r.output
+                for r in tools.call_logs
+            )
+            recovery_verified = scn.category != "recovery" or recovery_observed
+            task_passed = (
+                trajectory.status == scn.expected_status and not forbidden_hit
+                and not missing_tools and not grading["unexpected_write"] and recovery_verified
+                and not state_failures
+            )
             if task_passed:
                 success_count += 1
 
@@ -169,6 +248,12 @@ class EvalRunner:
                 "called_tools": called_tools,
                 "step_accuracy": round(step_accuracy, 3),
                 "tool_precision": round(tool_precision, 3),
+                "tool_recall": round(grading["tool_recall"], 3),
+                "missing_tools": missing_tools,
+                "unexpected_write": grading["unexpected_write"],
+                "recovery_observed": recovery_observed,
+                "state_failures": state_failures,
+                "fault_injected": tools.injected,
                 "wasted_steps": wasted_steps,
                 "duration_seconds": round(duration, 3),
                 "cost_usd": round(trajectory.total_cost_usd, 6),
@@ -204,6 +289,12 @@ class EvalRunner:
         }
 
         report = {
+            "backend": type(llm_client).__name__ if llm_client is not None else "MockDeterministicLLMClient",
+            "measurement_notes": [
+                "Mock tokens, costs and latency are simulated; they do not measure live model performance.",
+                "Scenario-specific ticket status, action payloads, balance deltas and order state are checked.",
+                "Recovery scenarios fail when no actual failure or duplicate-write guard is observed.",
+            ],
             "summary": summary,
             "scenario_results": results,
         }
@@ -241,3 +332,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

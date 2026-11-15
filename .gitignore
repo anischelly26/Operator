@@ -1,5 +1,6 @@
 # Environment variables & API keys
 .env
+.env.*
 *.env
 !.env.example
 
@@ -9,6 +10,7 @@ __pycache__/
 *$py.class
 *.so
 .pytest_cache/
+.runtime-temp/
 .coverage
 htmlcov/
 dist/
@@ -24,3 +26,4 @@ sandbox/data/emails/*.eml
 # Logs & trajectories
 logs/*.jsonl
 eval/results/*.json
+

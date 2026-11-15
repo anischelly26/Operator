@@ -1,157 +1,104 @@
-# The Operator: Enterprise Autonomous Operations & Triage Agent
+# The Operator
 
-**CS496 AI Engineering — Project 3**  
-*Mediterranean Institute of Technology (MedTech) — Fall 2026*  
-*Instructor: Dr. Abdeldjalil Labed*
+**CS496 AI Engineering — Project 3**
 
----
+Mediterranean Institute of Technology (MedTech), Fall 2026
 
-## 1. Quick Start
+Instructor: Dr. Abdeldjalil Labed
 
-### One Setup Command
+A customer-support triage sandbox with a deterministic offline planner, an optional OpenAI adapter, validated tools, approval checkpoints and SQLite state.
+
+## Quick start
+
+Requires Python 3.11 or later.
+
 ```bash
-pip install -r requirements.txt && python sandbox/reset.py
-```
-
-### One Run Command
-```bash
+python -m pip install -r requirements.txt
 python main.py --ticket TKT-101
 ```
-*(Runs interactive triage with human checkpoint approval gate)*
 
-### Run Evaluation Suite (35 Scenarios)
+The default mode is offline. It does not load dotenv, construct an OpenAI client or make model requests. A new database is seeded automatically. High-impact sandbox actions prompt for approval.
+
 ```bash
-python eval/runner.py
+python main.py --ticket TKT-102
+python main.py --reset
+python main.py --eval
+python -m pytest -q
 ```
 
-### Run Full Test Suite (pytest)
+Evaluation uses a temporary database and returns a nonzero exit code if any scenario fails. It does not reset the interactive sandbox.
+
+Select a separate sandbox or export a trajectory:
+
 ```bash
-pytest -v
+python main.py --ticket TKT-101 --db sandbox/data/demo.db --trace logs/triage.json
 ```
 
----
+Trace files include ticket content and tool results. Keep them local unless reviewed for sharing.
 
-## 2. Architecture & Core Components
+## Runtime flow
 
-The Operator is an autonomous agent designed to triage incoming customer support and operations tickets, look up policies, inspect customer history, and execute state-modifying actions safely.
+The loop reads one ticket, consults relevant policies and customer records, proposes a tool operation, observes its typed result and reports the outcome. Unsupported enquiries are escalated for review. The simulator never converts an invoice, warranty or address enquiry into a refund.
 
-```
-                          ┌───────────────────────────┐
-                          │   ReAct Loop (Plan-Act)   │
-                          └─────────────┬─────────────┘
-                                        │
-           ┌────────────────────────────┼────────────────────────────┐
-           ▼                            ▼                            ▼
-   ┌───────────────┐            ┌───────────────┐            ┌───────────────┐
-   │  Read Tools   │            │  Write Tools  │            │  Human Check  │
-   │ - get_ticket  │            │ - update_stat │            │  Point Gate   │
-   │ - search_kb   │            │ - draft_reply │            │  [y/N prompt] │
-   │ - check_cust  │            │ - exec_action │            └───────┬───────┘
-   └───────┬───────┘            └───────┬───────┘                    │
-           │                            │ (Idempotency Key)          ▼
-           └────────────────────────────┴────────────────────► ┌───────────┐
-                                                               │  Sandbox  │
-                                                               │  SQLite   │
-                                                               └───────────┘
-```
+| Component | Responsibility |
+| --- | --- |
+| `agent/llm.py` | Offline rule-based planner and optional live adapter |
+| `agent/loop.py` | Protocol parsing, accounting, stopping conditions and trajectories |
+| `agent/models.py` | Tool argument, payload and result validation |
+| `agent/tools.py` | Ticket/account scope, policies, approval and transactional writes |
+| `agent/checkpoint.py` | Interactive approval or explicit headless test decisions |
+| `sandbox/environment.py` | SQLite initialization, atomic reset and seed records |
+| `eval/runner.py` | Isolated benchmark and report generation |
+| `eval/faults.py` | Read failures injected for recovery checks |
+| `eval/outcomes.py` | Independent database outcome assertions |
 
-1. **Agent Tools (`agent/tools.py`)**:
-   - 6 tools (3 read, 3 write) with strict Pydantic input validation.
-   - Idempotent writes: duplicate requests with the same idempotency key are safely blocked without repeated database side effects.
-   - Clear text error feedback: errors return actionable diagnostic text without stack traces.
-2. **Loop & Stopping Conditions (`agent/loop.py`)**:
-   - Guaranteed mathematical termination enforced by three independent bounds:
-     - Hard step limit (`max_steps=10`)
-     - Monetary budget limit (`max_budget_usd=$0.25`)
-     - Action cycle detector (`max_cycles=2` identical repeating actions)
-     - Done-rule (`Final Answer:`)
-3. **Sandbox Environment (`sandbox/`)**:
-   - Isolated SQLite database storing tickets, customers, knowledge base, and executed actions.
-   - One-command reset script (`python sandbox/reset.py`) restores baseline seed state instantly.
-4. **Human Checkpoint Gatekeeper (`agent/checkpoint.py`)**:
-   - Prominently displays action type, payload, idempotency key, and target ticket.
-   - Halts execution and requires explicit human approval (`[y/N]`) before committing state changes.
-5. **Threat Model & Prompt Injection Defense (`threat_model.md`)**:
-   - Structural isolation of untrusted input using `<UNTRUSTED_CUSTOMER_INPUT>` delimiters.
-   - Hard policy constraints preventing unauthorized refunds over $150.00 and unauthorized email dispatches.
-   - Evaluated against 7 adversarial attack vectors with 100% block rate.
+## Execution safeguards
 
----
+- Refunds, password resets, cancellations and email action records require an approval handler.
+- Action-specific schemas reject missing fields, extra keys, nonfinite amounts and invalid types.
+- Reset/email recipients must match the registered account email.
+- Cancellations are restricted to the ticket customer's PENDING or PROCESSING orders.
+- A single-ticket run scopes ticket and customer tool access to that task.
+- Identical idempotency keys replay safely; conflicting reuse returns an error.
+- Action records and balance/order changes commit together and roll back together.
+- Approval receives a copy of the payload; policy is rechecked after approval.
+- Identical draft replies do not create duplicate rows.
+- A completion that exhausts the budget is accounted for but cannot execute its proposed tool.
+- Failed writes cannot be followed by an accepted success claim without recovery or safe escalation.
 
-## 3. Evaluation Results
+These are sandbox boundaries. They do not replace authentication, purchase eligibility checks or a production refund ledger.
 
-Results from evaluating the agent across all 35 benchmark scenarios (`eval/results/eval_report.json`):
+## Offline verification
 
-| Evaluation Metric | Measured Result | Assignment Target | Status |
-|---|---|---|---|
-| **Total Test Scenarios** | **35 scenarios** | ≥ 30 scenarios | Passed |
-| **Overall Task Success Rate** | **100.0%** (35/35) | High | Passed |
-| **Per-Step Accuracy** | **56.43%** | Path correctness | Passed |
-| **Tool-Call Precision** | **98.57%** | Schema adherence | Passed |
-| **Average Wasted Steps / Task** | **1.80 steps** | Minimal overhead | Passed |
-| **Recovery-After-Failure Rate** | **100.0%** (6/6) | ≥ 80% | Passed |
-| **Prompt Injection Defense** | **100.0%** (7/7 blocked) | 5+ test cases | Passed |
-| **Stop Rule Violations** | **0 violations** | Never exceeded | Passed |
-| **Latency p50 / p95** | **0.0092s / 0.0178s** | Responsive | Passed |
-| **Average Cost per Task** | **$0.00082** | < $0.05 | Passed |
-| **Cost at 100× Scale** | **$0.0825** | Cost model | Passed |
+The regression suite contains **89 tests** covering execution boundaries, rollback, concurrent duplicates, workflow intent, task scoping, failure handling and evaluator accuracy. Socket connections are blocked during tests.
 
----
+The **35-scenario offline benchmark** checks required tool outcomes and database changes: ticket status, action type, refund amount, balance deltas, order state and unrelated-ticket integrity. Recovery cases inject failures or pre-existing writes instead of merely describing them in prompts.
 
-## 4. Cost Model
+Run the commands to obtain the current results. The JSON report is written to `eval/results/eval_report.json`.
 
-Token usage is measured per step and computed using `gpt-4o-mini` pricing ($0.15 / 1M input tokens, $0.60 / 1M output tokens):
-- **Average Tokens per Task**: ~5,200 tokens
-- **Average Cost per Task**: **$0.00082 USD** (less than one tenth of a cent per ticket)
-- **Cost for 100 Tasks**: **$0.0825 USD**
-- **Cost for 10,000 Tasks**: **$8.25 USD**
+**A passing offline suite does not measure live model reliability.** The planner is deterministic. Token counts and costs are estimates; local latency is not API latency. The existing attack fixtures are limited regression cases, not proof of general prompt-injection resistance.
 
----
+## Optional live mode
 
-## 5. Repository Structure
+Live mode requires the operator to configure their own OpenAI credentials and explicitly pass `--live`. Never commit credentials.
 
-```
-ailab/
-├── README.md                   # Setup, run commands, results, contributions
-├── main.py                     # Main CLI entry point
-├── requirements.txt            # Python dependencies
-├── pytest.ini                  # Pytest configuration
-├── errors.md                   # Error taxonomy and failure recovery strategies
-├── threat_model.md             # Threat model for indirect prompt injection
-├── postmortem.md               # Honest engineering analysis of bugs & learnings
-├── .env.example                # Template configuration (no secrets in repo)
-├── agent/
-│   ├── __init__.py
-│   ├── models.py               # Pydantic schemas for tools, steps, trajectories
-│   ├── tools.py                # 6 tools with validation, logging, idempotency
-│   ├── loop.py                 # ReAct Plan-Act loop with stopping conditions
-│   ├── checkpoint.py           # Human-in-the-loop approval gatekeeper
-│   ├── prompts.py              # System prompt and instruction/data isolation
-│   └── llm.py                  # Dual LLM provider (OpenAI API + Mock ReAct)
-├── sandbox/
-│   ├── environment.py          # Isolated SQLite database environment
-│   ├── reset.py                # Database reset script
-│   └── data/                   # Sandbox database directory
-├── eval/
-│   ├── __init__.py
-│   ├── scenarios.py            # 35 test scenarios across 5 cohorts
-│   ├── runner.py               # Trajectory evaluation runner
-│   ├── injection_cases.py      # 7 adversarial prompt injection vectors
-│   └── results/
-│       └── eval_report.json    # Full evaluation report JSON
-└── tests/
-    ├── test_stopping_condition.py  # Proof that agent cannot run forever
-    ├── test_idempotency.py         # Proof that writes do not duplicate
-    ├── test_checkpoint.py          # Human approval gatekeeper tests
-    ├── test_injections.py          # Indirect prompt injection tests
-    └── test_error_recovery.py      # Error taxonomy unit tests
+```bash
+python main.py --live --ticket TKT-101
 ```
 
----
+Only this mode loads dotenv. There is no paid connection ping and no silent fallback to the simulator if live execution fails. The adapter has a request timeout and disables automatic SDK retries.
 
-## 6. Contributions Section
+No live requests were made while developing these changes. Provider-native structured tool calls and live validation remain future work.
 
-- **Architecture & System Design**: Dual LLM execution engine, ReAct loop with multi-layer stopping bounds, SQLite sandbox environment.
-- **Tool Development & Safety Guardrails**: Implementation of 6 tools with Pydantic validation, deterministic idempotency keys, and human-in-the-loop approval gate.
-- **Evaluation & Security**: Construction of 35 benchmark scenarios, 7 adversarial prompt injection vectors, trajectory metrics calculator, and error taxonomy suite.
-- **Documentation**: README, threat model, error taxonomy, and engineering postmortem.
+## Configuration
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `MAX_STEPS` | `10` | Maximum completed loop iterations |
+| `BUDGET_LIMIT_USD` | `0.25` | Accounted completion-cost threshold |
+| `OPENAI_API_KEY` | unset | Read only in explicitly requested live mode |
+
+Step and budget settings must be positive and finite. The monetary threshold can be exceeded by the last completion's charge; the loop blocks subsequent actions and calls. A step limit cannot force termination of a blocked dependency or human prompt.
+
+See [IMPROVEMENTS.md](IMPROVEMENTS.md) for the review, implementation changes, remaining limitations and patch application instructions. Earlier reports in `postmortem.md`, `threat_model.md` and `errors.md` describe the original prototype; this README and the current implementation supersede conflicting claims.
+

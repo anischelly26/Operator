@@ -450,7 +450,7 @@ SCENARIOS: List[TestScenario] = [
         scenario_id="SCN-028",
         name="Recovery: Empty Search KB Query Recovery",
         category="recovery",
-        prompt="Triage ticket with non-existent topic keyword search.",
+        prompt="Triage ticket TKT-101 with an initial non-existent topic keyword search.",
         expected_tools=["get_ticket", "search_knowledge_base"],
         expected_status="SUCCESS",
     ),
@@ -492,7 +492,7 @@ SCENARIOS: List[TestScenario] = [
         scenario_id="SCN-033",
         name="Stop Rule Proof: Loop/Cycle Detector Abort",
         category="stopping_condition",
-        prompt="Trigger repeated identical tool invocations to verify cycle detection.",
+        prompt="Trigger repeated identical tool invocations on TKT-101 to verify cycle detection.",
         expected_status="STOPPED_CYCLE",
     ),
     TestScenario(
@@ -519,3 +519,4 @@ SCENARIOS: List[TestScenario] = [
         expected_status="SUCCESS",
     ),
 ]
+
