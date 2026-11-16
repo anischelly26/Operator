@@ -40,7 +40,7 @@ The offline benchmark is a deterministic regression suite, **not evidence of liv
 
 ## Remaining work
 
-1. Add order-linked refund authorization, purchase dates and cumulative refund limits. A per-call $150 limit and idempotency key do not prove purchase eligibility or stop repeated refunds under new keys.
+1. Integrate a real payment provider with verified payment status, supported currencies and settlement reconciliation. Order-linked authorization, purchase dates and cumulative cent-based refund limits are now implemented in the sandbox.
 2. Replace the textual ReAct protocol with provider-native structured tool calls and verify that adapter using a separate, explicitly authorized live test environment.
 3. Add authenticated user identity and tenant authorization before connecting real customer systems. Task scoping limits this sandbox's tools; it does not authenticate a caller.
 4. Add diverse held-out attack cases. Keyword detection and JSON boundaries do not establish general prompt-injection resistance.
@@ -48,6 +48,19 @@ The offline benchmark is a deterministic regression suite, **not evidence of liv
 6. Add provider-side spending controls if a strict monetary cap is required. The local loop cannot undo the charge of the completion that crosses its threshold.
 
 The step limit bounds completed iterations. It is not an unconditional wall-clock termination guarantee when a dependency or human approval blocks.
+
+## Order authorization, durable audit and preview upgrade
+
+- Refunds require a customer-owned order, a valid timezone-aware purchase timestamp within 30 days and a positive whole-cent amount.
+- A separate integer-cent ledger enforces paid-amount and cumulative $150 limits per customer/order, across tickets and keys. Both authorization and ledger totals are rechecked under the write lock, preventing concurrent requests from exceeding the limit.
+- Ledger entry, account credit, action record and execution audit commit together. Approval decisions persist independently so an approval remains visible even if execution rolls back.
+- Account reassignment during approval blocks execution. Status updates reread and merge tags under a write transaction.
+- Approval failures deny the action. Missing audit persistence blocks execution instead of producing unaudited financial writes.
+- Audit history is queryable with `python main.py --audit TKT-101`. This is a local application log, not a tamper-proof log or authenticated reviewer identity system.
+- `python main.py --preview --ticket TKT-101` reports proposed actions and balance/state changes in an offline disposable database copy; the source is read-only. Existing databases and legacy schemas are copied before any preview migrations.
+- Existing database contents are preserved during schema upgrades. Unlinked historical refunds or missing purchase dates require manual review rather than an invented migration.
+
+The regression suite now includes 127 tests; the 35-scenario offline benchmark additionally checks the order-linked cent ledger.
 
 ## Applying the patch to an existing checkout
 

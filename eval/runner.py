@@ -130,7 +130,7 @@ class EvalRunner:
             if scn.scenario_id == "SCN-027":
                 seeded = tools.execute(ToolCall(name="execute_action", arguments={
                     "ticket_id": "TKT-101", "action_type": "ISSUE_REFUND",
-                    "payload": {"amount": 120.0, "reason": "Customer requested refund"},
+                    "payload": {"order_id": "ORD-501", "amount": 120.0, "reason": "Customer requested refund"},
                     "idempotency_key": "TKT-101-ISSUE_REFUND-001",
                 }))
                 if seeded.is_error:

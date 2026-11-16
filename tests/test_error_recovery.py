@@ -63,7 +63,7 @@ def test_error_class_policy_violation(sandbox):
         arguments={
             "ticket_id": "TKT-101",
             "action_type": "ISSUE_REFUND",
-            "payload": {"amount": 500.0},
+            "payload": {"order_id": "ORD-501", "amount": 500.0},
             "idempotency_key": "IDEMP-POL-01",
         },
     )
@@ -107,3 +107,4 @@ def test_error_class_user_rejection(sandbox):
     assert res.is_error
     assert res.error_type == "UserRejectionError"
     assert "Human Checkpoint DENIED" in res.output
+

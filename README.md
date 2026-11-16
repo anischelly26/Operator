@@ -24,6 +24,8 @@ python main.py --ticket TKT-102
 python main.py --reset
 python main.py --eval
 python -m pytest -q
+python main.py --preview --ticket TKT-101
+python main.py --audit TKT-101
 ```
 
 Evaluation uses a temporary database and returns a nonzero exit code if any scenario fails. It does not reset the interactive sandbox.
@@ -47,6 +49,8 @@ The loop reads one ticket, consults relevant policies and customer records, prop
 | `agent/models.py` | Tool argument, payload and result validation |
 | `agent/tools.py` | Ticket/account scope, policies, approval and transactional writes |
 | `agent/checkpoint.py` | Interactive approval or explicit headless test decisions |
+| `agent/refunds.py` | Order ownership, purchase window, cumulative limits and exact cent accounting |
+| `agent/preview.py` | Complete offline workflow against a disposable database copy |
 | `sandbox/environment.py` | SQLite initialization, atomic reset and seed records |
 | `eval/runner.py` | Isolated benchmark and report generation |
 | `eval/faults.py` | Read failures injected for recovery checks |
@@ -63,14 +67,27 @@ The loop reads one ticket, consults relevant policies and customer records, prop
 - Action records and balance/order changes commit together and roll back together.
 - Approval receives a copy of the payload; policy is rechecked after approval.
 - Identical draft replies do not create duplicate rows.
+- Refunds require an explicit customer-owned order and a valid timezone-aware purchase date within 30 days.
+- Integer-cent refund records enforce cumulative limits across tickets and idempotency keys: total operator refunds cannot exceed the paid amount or $150 per order.
+- Approval decisions survive restarts; a committed financial action and its execution audit are recorded atomically.
 - A completion that exhausts the budget is accounted for but cannot execute its proposed tool.
 - Failed writes cannot be followed by an accepted success claim without recovery or safe escalation.
 
-These are sandbox boundaries. They do not replace authentication, purchase eligibility checks or a production refund ledger.
+These are sandbox boundaries. They do not replace caller authentication, verified damage evidence or settlement through a real payment provider.
+
+## Preview changes and inspect history
+
+`python main.py --preview --ticket TKT-101` runs the offline planner on a temporary database copy. The JSON output shows proposed actions, ticket state before/after and balance changes. Preview approvals are simulated automatically inside that copy; the source database is opened read-only and remains unchanged. If no source database exists, preview uses temporary seed data without creating a source file.
+
+`python main.py --preview --ticket TKT-101 --trace logs/preview.json` also saves the preview report.
+
+`python main.py --audit TKT-101` prints persisted approval/rejection reasons, exact reviewed payloads and committed action records. An approval alone is not proof of execution: look for the separate EXECUTED event and action record. Explicit sandbox reset clears runtime audit and financial history.
+
+Existing databases receive the new tables without resetting their data. Missing/invalid purchase dates and historical refunds without an order ledger require manual review; the program does not guess dates or financial history. Refund payloads must now include `order_id` as well as `amount`; fractional cents are rejected.
 
 ## Offline verification
 
-The regression suite contains **89 tests** covering execution boundaries, rollback, concurrent duplicates, workflow intent, task scoping, failure handling and evaluator accuracy. Socket connections are blocked during tests.
+The regression suite contains **127 tests** covering execution boundaries, order-level refund limits, concurrent requests with different keys, exact cents, purchase dates, durable audits, read-only preview, rollback, workflow intent, task scoping, failure handling and evaluator accuracy. Socket connections are blocked during tests.
 
 The **35-scenario offline benchmark** checks required tool outcomes and database changes: ticket status, action type, refund amount, balance deltas, order state and unrelated-ticket integrity. Recovery cases inject failures or pre-existing writes instead of merely describing them in prompts.
 

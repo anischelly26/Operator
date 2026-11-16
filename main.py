@@ -1,13 +1,16 @@
 """CLI for offline sandbox triage, explicit live mode and evaluation."""
 
 import argparse
+import json
 import os
 import re
+import sqlite3
 from pathlib import Path
 
 from agent.checkpoint import HumanCheckpoint
 from agent.llm import MockDeterministicLLMClient, OpenAILLMClient
 from agent.loop import AgentLoop
+from agent.preview import preview_ticket
 from agent.tools import ToolRegistry
 from eval.runner import EvalRunner
 from sandbox.environment import SandboxEnvironment
@@ -50,13 +53,28 @@ def main():
     mode.add_argument("--eval", action="store_true", help="Run the offline benchmark in an isolated database")
     mode.add_argument("--reset", action="store_true", help="Reset the selected sandbox database")
     mode.add_argument("--live", action="store_true", help="Explicitly enable live OpenAI calls")
+    mode.add_argument("--audit", metavar="TICKET", help="Print persisted approval decisions and committed actions as JSON")
+    mode.add_argument("--preview", action="store_true", help="Preview an offline workflow in a disposable database copy")
     parser.add_argument("--ticket", default="TKT-101", help="Ticket ID to triage")
     parser.add_argument("--db", type=Path, help="Optional SQLite sandbox path")
     parser.add_argument("--trace", type=Path, help="Write the triage trajectory as JSON")
     args = parser.parse_args()
     if not re.fullmatch(r"TKT-[A-Za-z0-9_-]+", args.ticket):
         parser.error("--ticket must be a ticket identifier such as TKT-101")
+    if args.audit and not re.fullmatch(r"TKT-[A-Za-z0-9_-]+", args.audit):
+        parser.error("--audit requires a ticket identifier such as TKT-101")
     try:
+        if args.preview:
+            report = preview_ticket(args.ticket, db_path=args.db)
+            print(json.dumps(report, indent=2))
+            if args.trace:
+                args.trace.parent.mkdir(parents=True, exist_ok=True)
+                args.trace.write_text(json.dumps(report, indent=2), encoding="utf-8")
+            return 0 if report["trajectory"]["status"] == "SUCCESS" else 1
+        if args.audit:
+            with SandboxEnvironment(db_path=args.db) as env:
+                print(json.dumps(env.audit_ticket(args.audit), indent=2))
+            return 0
         if args.reset:
             with SandboxEnvironment(db_path=args.db) as env:
                 env.reset()
@@ -70,7 +88,7 @@ def main():
             args.trace.parent.mkdir(parents=True, exist_ok=True)
             args.trace.write_text(trajectory.model_dump_json(indent=2), encoding="utf-8")
         return 0 if trajectory.status == "SUCCESS" else 1
-    except (ValueError, OSError) as error:
+    except (ValueError, OSError, sqlite3.Error) as error:
         parser.exit(2, f"Configuration or file error: {error}\n")
 
 

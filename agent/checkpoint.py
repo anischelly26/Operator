@@ -13,6 +13,10 @@ class HumanCheckpoint:
         mode: 'interactive' (prompts human via terminal input) or 'headless' (eval/automated mode).
         auto_approve: If True in headless mode, automatically approves valid actions.
         """
+        if mode not in {"interactive", "headless"}:
+            raise ValueError("Checkpoint mode must be interactive or headless")
+        if not isinstance(auto_approve, bool):
+            raise ValueError("auto_approve must be a boolean")
         self.mode = mode
         self.auto_approve = auto_approve
         self.decision_history: list = []
@@ -76,3 +80,4 @@ class HumanCheckpoint:
             "approved": approved,
             "reason": reason,
         })
+

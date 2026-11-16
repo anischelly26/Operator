@@ -4,7 +4,8 @@ Ensures strict validation, type safety, trajectory logging, and error representa
 """
 
 from typing import Any, Dict, List, Literal, Optional
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from agent.refunds import money_to_cents
 
 
 # ---------------------------------------------------------------------------
@@ -43,8 +44,15 @@ class DraftReplyArgs(ToolArgs):
 
 
 class RefundPayload(ToolArgs):
+    order_id: str = Field(..., min_length=1, description="Order belonging to the ticket customer.")
     amount: float = Field(..., gt=0, allow_inf_nan=False)
     reason: Optional[str] = None
+
+    @field_validator("amount")
+    @classmethod
+    def whole_cents(cls, value):
+        money_to_cents(value)
+        return value
 
 
 class ResetPasswordPayload(ToolArgs):
@@ -74,7 +82,10 @@ class ExecuteActionArgs(ToolArgs):
     action_type: Literal["SEND_EMAIL", "ISSUE_REFUND", "RESET_PASSWORD", "CANCEL_ORDER"] = Field(
         ..., description="High-impact action to execute. Must pass human checkpoint."
     )
-    payload: Dict[str, Any] = Field(..., description="Specific parameters for the action.")
+    payload: Dict[str, Any] = Field(
+        ..., description="ISSUE_REFUND: order_id, amount, optional reason. RESET_PASSWORD: target_email. "
+        "CANCEL_ORDER: order_id. SEND_EMAIL: recipient, subject, body. Refunds require whole cents and order authorization.",
+    )
     idempotency_key: str = Field(
         ..., min_length=1, max_length=200, description="Unique key to prevent duplicate writes if repeated (e.g., TKT-101-REFUND-001)."
     )

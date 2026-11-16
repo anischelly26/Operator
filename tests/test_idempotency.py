@@ -28,7 +28,7 @@ def test_execute_action_idempotency_prevents_duplicate_refunds(sandbox):
         arguments={
             "ticket_id": "TKT-101",
             "action_type": "ISSUE_REFUND",
-            "payload": {"amount": 50.0, "reason": "Damaged goods"},
+            "payload": {"order_id": "ORD-501", "amount": 50.0, "reason": "Damaged goods"},
             "idempotency_key": "IDEMP-REFUND-TKT-101-001",
         },
     )
@@ -80,3 +80,4 @@ def test_update_ticket_status_idempotency(sandbox):
     res2 = tools.execute(call)
     assert "Idempotent update" in res2.output
     assert "No database modification performed" in res2.output
+

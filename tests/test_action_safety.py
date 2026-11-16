@@ -22,7 +22,7 @@ def env():
 def action(action_type="ISSUE_REFUND", payload=None, key="safe-action", ticket="TKT-101"):
     return ToolCall(name="execute_action", arguments={
         "ticket_id": ticket, "action_type": action_type,
-        "payload": {"amount": 25.0} if payload is None else payload,
+        "payload": {"order_id": "ORD-501", "amount": 25.0} if payload is None else payload,
         "idempotency_key": key,
     })
 
@@ -54,7 +54,9 @@ def test_missing_checkpoint_denies_write(env):
 def test_invalid_refund_payload_never_reaches_checkpoint(env, payload):
     before = snapshot(env)
     approvals = []
-    result = ToolRegistry(env, lambda **kw: approvals.append(kw)).execute(action(payload=payload))
+    result = ToolRegistry(env, lambda **kw: approvals.append(kw)).execute(
+        action(payload={"order_id": "ORD-501", **payload}),
+    )
     assert result.error_type == "BadArgumentsError"
     assert not approvals
     assert snapshot(env) == before
@@ -116,7 +118,7 @@ def test_missing_ticket_or_account_cannot_record_success(env, ticket):
 
 
 @pytest.mark.parametrize("changed", [
-    action(payload={"amount": 26.0}),
+    action(payload={"order_id": "ORD-501", "amount": 26.0}),
     action(ticket="TKT-102"),
     action("RESET_PASSWORD", {"target_email": "alice@example.com"}),
 ])

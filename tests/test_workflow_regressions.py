@@ -104,7 +104,7 @@ def test_failed_write_followed_by_claimed_success_is_failed(env):
     class LyingClient(BaseLLMClient):
         def complete(self, messages):
             if len(messages) == 2:
-                return 'Action: execute_action | {"ticket_id":"TKT-101","action_type":"ISSUE_REFUND","payload":{"amount":999.0},"idempotency_key":"bad"}', 10, 10, 0.00001
+                return 'Action: execute_action | {"ticket_id":"TKT-101","action_type":"ISSUE_REFUND","payload":{"order_id":"ORD-501","amount":999.0},"idempotency_key":"bad"}', 10, 10, 0.00001
             return "Final Answer: Refund successfully completed.", 10, 10, 0.00001
     trajectory = AgentLoop(LyingClient(), ToolRegistry(env)).run("lying", "Triage TKT-101")
     assert trajectory.status == "FAILED"

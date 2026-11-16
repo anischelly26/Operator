@@ -11,7 +11,7 @@ from sandbox.environment import SandboxEnvironment
 class ExpensiveWrite(BaseLLMClient):
     def complete(self, messages):
         return ('Action: execute_action | {"ticket_id":"TKT-101","action_type":"ISSUE_REFUND",'
-                '"payload":{"amount":25.0},"idempotency_key":"over-budget"}', 100, 20, 0.5)
+                '"payload":{"order_id":"ORD-501","amount":25.0},"idempotency_key":"over-budget"}', 100, 20, 0.5)
 
 
 def test_over_budget_completion_cannot_execute_write():

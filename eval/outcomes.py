@@ -21,6 +21,7 @@ def snapshot(conn):
         "customers": {r["customer_id"]: dict(r) for r in conn.execute("SELECT customer_id, balance, orders, email FROM customers")},
         "tickets": {r["ticket_id"]: dict(r) for r in conn.execute("SELECT ticket_id, status, tags FROM tickets")},
         "actions": {r["idempotency_key"]: dict(r) for r in conn.execute("SELECT * FROM executed_actions")},
+        "refunds": {r["idempotency_key"]: dict(r) for r in conn.execute("SELECT * FROM refund_ledger")},
     }
 
 
@@ -57,6 +58,17 @@ def grade_outcome(scenario, before, after):
             failures.append("Password reset targeted wrong account")
 
     new_actions = [a for key, a in after["actions"].items() if key not in before["actions"]]
+    for action in actions:
+        if action["action_type"] == "ISSUE_REFUND":
+            ledger = after["refunds"].get(action["idempotency_key"])
+            payload = json.loads(action["payload"])
+            expected_order = "ORD-601" if number == 7 else "ORD-501"
+            if (ledger is None or ledger["order_id"] != expected_order
+                    or payload.get("order_id") != expected_order
+                    or ledger["amount_cents"] != round(payload["amount"] * 100)):
+                failures.append("Refund action is not backed by the correct cent-based order ledger")
+    if len(after["refunds"]) != sum(a["action_type"] == "ISSUE_REFUND" for a in actions):
+        failures.append("Refund ledger and action records disagree")
     for customer_id, customer in before["customers"].items():
         current = after["customers"][customer_id]
         refunds = sum(

@@ -7,6 +7,7 @@ knowledge base articles, and executed actions.
 import json
 import os
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -29,6 +30,7 @@ class SandboxEnvironment:
         if self.conn is None:
             self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
             self.conn.row_factory = sqlite3.Row
+            self.conn.execute("PRAGMA foreign_keys = ON")
         return self.conn
 
     def _init_db(self):
@@ -95,6 +97,31 @@ class SandboxEnvironment:
             )
         """)
 
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS refund_ledger (
+                idempotency_key TEXT PRIMARY KEY,
+                customer_id TEXT NOT NULL,
+                order_id TEXT NOT NULL,
+                amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (idempotency_key) REFERENCES executed_actions(idempotency_key)
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS refund_order_idx ON refund_ledger(customer_id, order_id)")
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS audit_events (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                ticket_id TEXT NOT NULL,
+                action_type TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                reason TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS audit_ticket_idx ON audit_events(ticket_id, event_id)")
+
         conn.commit()
 
     def reset(self, custom_seed_file: Optional[Path] = None):
@@ -102,6 +129,8 @@ class SandboxEnvironment:
         conn = self.get_connection()
         cursor = conn.cursor()
         with conn:
+            cursor.execute("DELETE FROM audit_events")
+            cursor.execute("DELETE FROM refund_ledger")
             cursor.execute("DELETE FROM tickets")
             cursor.execute("DELETE FROM customers")
             cursor.execute("DELETE FROM knowledge_base")
@@ -151,6 +180,7 @@ class SandboxEnvironment:
         )
 
         # Seed Customers
+        purchased_at = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
         customers = [
             (
                 "CUST-001",
@@ -159,8 +189,8 @@ class SandboxEnvironment:
                 "premium",
                 45.50,
                 json.dumps([
-                    {"order_id": "ORD-501", "item": "Ergonomic Keyboard", "amount": 120.0, "status": "DELIVERED"},
-                    {"order_id": "ORD-502", "item": "USB-C Hub", "amount": 35.0, "status": "PROCESSING"}
+                    {"order_id": "ORD-501", "item": "Ergonomic Keyboard", "amount": 120.0, "status": "DELIVERED", "purchased_at": purchased_at},
+                    {"order_id": "ORD-502", "item": "USB-C Hub", "amount": 35.0, "status": "PROCESSING", "purchased_at": purchased_at}
                 ])
             ),
             (
@@ -170,7 +200,7 @@ class SandboxEnvironment:
                 "standard",
                 0.0,
                 json.dumps([
-                    {"order_id": "ORD-601", "item": "Mechanical Mouse", "amount": 65.0, "status": "DELIVERED"}
+                    {"order_id": "ORD-601", "item": "Mechanical Mouse", "amount": 65.0, "status": "DELIVERED", "purchased_at": purchased_at}
                 ])
             ),
             (
@@ -180,7 +210,7 @@ class SandboxEnvironment:
                 "enterprise",
                 500.0,
                 json.dumps([
-                    {"order_id": "ORD-701", "item": "Server Rack Rail Kit", "amount": 320.0, "status": "PROCESSING"}
+                    {"order_id": "ORD-701", "item": "Server Rack Rail Kit", "amount": 320.0, "status": "PROCESSING", "purchased_at": purchased_at}
                 ])
             ),
         ]
@@ -232,6 +262,31 @@ class SandboxEnvironment:
             "INSERT INTO tickets (ticket_id, customer_id, sender_email, subject, body, status, tags) VALUES (?, ?, ?, ?, ?, ?, ?)",
             sample_tickets
         )
+
+    def record_audit(self, event_type, ticket_id, action_type, idempotency_key, payload, reason=None, commit=True):
+        conn = self.get_connection()
+        query = (
+            "INSERT INTO audit_events (event_type, ticket_id, action_type, idempotency_key, payload, reason) "
+            "VALUES (?, ?, ?, ?, ?, ?)"
+        )
+        values = (event_type, ticket_id, action_type, idempotency_key, json.dumps(payload, sort_keys=True, allow_nan=False), reason)
+        if commit:
+            with conn:
+                conn.execute(query, values)
+        else:
+            conn.execute(query, values)
+
+    def audit_ticket(self, ticket_id):
+        conn = self.get_connection()
+        events = [dict(row) for row in conn.execute(
+            "SELECT * FROM audit_events WHERE ticket_id = ? ORDER BY event_id", (ticket_id,),
+        )]
+        actions = [dict(row) for row in conn.execute(
+            "SELECT * FROM executed_actions WHERE ticket_id = ? ORDER BY executed_at, idempotency_key", (ticket_id,),
+        )]
+        for record in events + actions:
+            record["payload"] = json.loads(record["payload"])
+        return {"ticket_id": ticket_id, "events": events, "committed_actions": actions}
 
     def __enter__(self):
         return self

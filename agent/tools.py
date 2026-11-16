@@ -28,6 +28,7 @@ from agent.models import (
     UpdateStatusArgs,
 )
 from sandbox.environment import SandboxEnvironment
+from agent.refunds import RefundPolicyError, authorize_refund
 
 
 class ToolRegistry:
@@ -36,6 +37,27 @@ class ToolRegistry:
         self.checkpoint_handler = checkpoint_handler
         self.call_logs: List[ToolResult] = []
         self.ticket_scope = ticket_scope
+
+    def _request_approval(self, ticket_id, action_type, payload, idempotency_key):
+        reviewed_payload = copy.deepcopy(payload)
+        if self.checkpoint_handler is None:
+            approved, reason = False, "No approval handler configured."
+        else:
+            try:
+                approved, reason = self.checkpoint_handler(
+                    ticket_id=ticket_id, action_type=action_type,
+                    payload=copy.deepcopy(reviewed_payload), idempotency_key=idempotency_key,
+                )
+                approved = approved is True
+                reason = str(reason)
+            except Exception as error:
+                approved, reason = False, f"Approval handler failed ({type(error).__name__})."
+        # Persist before any write; if audit persistence fails, execution fails closed.
+        self.sandbox.record_audit(
+            "APPROVED" if approved else "DENIED", ticket_id, action_type, idempotency_key,
+            reviewed_payload, reason,
+        )
+        return approved, reason
 
     def get_schemas(self) -> List[Dict[str, Any]]:
         """Returns OpenAI-compatible function calling schemas."""
@@ -254,7 +276,7 @@ class ToolRegistry:
             )
 
         if self.checkpoint_handler:
-            approved, reason = self.checkpoint_handler(
+            approved, reason = self._request_approval(
                 ticket_id=args.ticket_id,
                 action_type=f"UPDATE_STATUS_TO_{args.status}",
                 payload={"new_status": args.status, "tags": sorted(new_tags)},
@@ -263,12 +285,20 @@ class ToolRegistry:
             if approved is not True:
                 return f"Human Checkpoint DENIED status update for ticket '{args.ticket_id}'. Reason: {reason}."
 
-        merged_tags = sorted(existing_tags.union(new_tags))
-        cursor.execute(
-            "UPDATE tickets SET status = ?, tags = ?, updated_at = CURRENT_TIMESTAMP WHERE ticket_id = ?",
-            (args.status, json.dumps(merged_tags), args.ticket_id),
-        )
-        conn.commit()
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute("SELECT status, tags FROM tickets WHERE ticket_id = ?", (args.ticket_id,)).fetchone()
+            if current is None:
+                return f"Error: Cannot update non-existent ticket '{args.ticket_id}'."
+            merged_tags = sorted(set(json.loads(current["tags"])).union(new_tags))
+            conn.execute(
+                "UPDATE tickets SET status = ?, tags = ?, updated_at = CURRENT_TIMESTAMP WHERE ticket_id = ?",
+                (args.status, json.dumps(merged_tags), args.ticket_id),
+            )
+            self.sandbox.record_audit(
+                "EXECUTED", args.ticket_id, f"UPDATE_STATUS_TO_{args.status}", f"{args.ticket_id}-STATUS-{args.status}",
+                {"new_status": args.status, "tags": merged_tags}, commit=False,
+            )
         return f"Success: Ticket '{args.ticket_id}' updated to status '{args.status}' with tags {merged_tags}."
 
     def _draft_reply(self, args: DraftReplyArgs) -> str:
@@ -290,16 +320,19 @@ class ToolRegistry:
             conn.execute(
                 "INSERT INTO drafts (ticket_id, recipient, subject, body) VALUES (?, ?, ?, ?)", values,
             )
+            self.sandbox.record_audit(
+                "EXECUTED", args.ticket_id, "DRAFT_REPLY", f"draft-{args.ticket_id}",
+                args.model_dump(), commit=False,
+            )
         return f"Success: Draft reply saved for ticket '{args.ticket_id}' to recipient '{args.recipient}'."
 
     def _action_policy(self, args: ExecuteActionArgs, customer) -> Optional[Tuple[str, bool, str]]:
         """Enforce policy against account data, independently of model reasoning."""
-        if args.action_type == "ISSUE_REFUND" and args.payload["amount"] > 150.0:
-            return (
-                f"Policy violation: Requested refund of ${args.payload['amount']:.2f} exceeds operator limit of $150.00. "
-                "Action blocked. Please escalate ticket to a supervisor instead.",
-                True, "PolicyViolationError",
-            )
+        if args.action_type == "ISSUE_REFUND":
+            try:
+                authorize_refund(self.sandbox.get_connection(), customer, args.payload)
+            except RefundPolicyError as error:
+                return f"Policy violation: {error}", True, "PolicyViolationError"
         if args.action_type in {"RESET_PASSWORD", "SEND_EMAIL"}:
             key = "target_email" if args.action_type == "RESET_PASSWORD" else "recipient"
             if args.payload[key].casefold() != customer["email"].strip().casefold():
@@ -358,14 +391,13 @@ class ToolRegistry:
         customer = account()
         if customer is None:
             return "Error: Ticket or registered customer not found.", True, "EmptyResultError"
+        approved_customer_id = customer["customer_id"]
         violation = self._action_policy(args, customer)
         if violation is not None:
             return violation
 
         # No handler means no approval. Never silently bypass the checkpoint.
-        if self.checkpoint_handler is None:
-            return "Human Checkpoint DENIED: No approval handler configured.", True, "UserRejectionError"
-        approved, reason = self.checkpoint_handler(
+        approved, reason = self._request_approval(
             ticket_id=args.ticket_id,
             action_type=args.action_type,
             payload=copy.deepcopy(args.payload),
@@ -388,9 +420,12 @@ class ToolRegistry:
             customer = account()
             if customer is None:
                 return "Error: Ticket or registered customer not found.", True, "EmptyResultError"
+            if customer["customer_id"] != approved_customer_id:
+                return "Security policy violation: Ticket account changed during approval.", True, "SecurityViolationError"
             violation = self._action_policy(args, customer)
             if violation is not None:
                 return violation
+            authorization = authorize_refund(conn, customer, args.payload) if args.action_type == "ISSUE_REFUND" else None
             conn.execute(
                 "INSERT INTO executed_actions (idempotency_key, ticket_id, action_type, payload) VALUES (?, ?, ?, ?)",
                 (args.idempotency_key, args.ticket_id, args.action_type, serialized_payload),
@@ -406,9 +441,16 @@ class ToolRegistry:
                 )
             elif args.action_type == "ISSUE_REFUND":
                 conn.execute(
-                    "UPDATE customers SET balance = balance + ? WHERE customer_id = ?",
-                    (args.payload["amount"], customer["customer_id"]),
+                    "INSERT INTO refund_ledger (idempotency_key, customer_id, order_id, amount_cents) VALUES (?, ?, ?, ?)",
+                    (args.idempotency_key, authorization.customer_id, authorization.order_id, authorization.amount_cents),
                 )
+                conn.execute(
+                    "UPDATE customers SET balance = ROUND(balance + ?, 2) WHERE customer_id = ?",
+                    (authorization.amount_cents / 100, customer["customer_id"]),
+                )
+            self.sandbox.record_audit(
+                "EXECUTED", args.ticket_id, args.action_type, args.idempotency_key, args.payload, commit=False,
+            )
         return (
             f"Success: Action '{args.action_type}' committed in sandbox with idempotency_key '{args.idempotency_key}'. "
             f"Details: {args.payload}",

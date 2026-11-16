@@ -166,7 +166,7 @@ class MockDeterministicLLMClient(BaseLLMClient):
                     return finish("RESOLVED", ["invalid_amount"], "No financial transaction was made for a zero-dollar adjustment.")
                 if amount is None or amount > 150 or order is None or amount > float(order["amount"]):
                     return finish("ESCALATED", ["refund_review"], "Refund requires human review; no authorized order amount could be established within the limit.")
-                payload = {"amount": amount, "reason": "Customer requested refund"}
+                payload = {"order_id": order["order_id"], "amount": amount, "reason": "Customer requested refund"}
         return self._action(
             "execute_action", ticket_id=ticket_id, action_type=intent, payload=payload,
             idempotency_key=f"{ticket_id}-{intent}-001",
