@@ -11,6 +11,7 @@ from agent.checkpoint import HumanCheckpoint
 from agent.llm import MockDeterministicLLMClient, OpenAILLMClient
 from agent.loop import AgentLoop
 from agent.preview import preview_ticket
+from agent.workspace import import_tickets, ticket_queue, preview_batch
 from agent.tools import ToolRegistry
 from eval.runner import EvalRunner
 from sandbox.environment import SandboxEnvironment
@@ -55,6 +56,12 @@ def main():
     mode.add_argument("--live", action="store_true", help="Explicitly enable live OpenAI calls")
     mode.add_argument("--audit", metavar="TICKET", help="Print persisted approval decisions and committed actions as JSON")
     mode.add_argument("--preview", action="store_true", help="Preview an offline workflow in a disposable database copy")
+    mode.add_argument("--import-tickets", type=Path, help="Atomically import a JSON ticket array")
+    mode.add_argument("--list-tickets", action="store_true", help="Inspect and search the ticket queue")
+    mode.add_argument("--preview-batch", nargs="+", metavar="TICKET", help="Sequential offline preview of up to 100 tickets")
+    parser.add_argument("--status", choices=["OPEN", "IN_PROGRESS", "RESOLVED", "ESCALATED", "ARCHIVED"])
+    parser.add_argument("--search", default="", help="Literal ticket ID or subject search")
+    parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--ticket", default="TKT-101", help="Ticket ID to triage")
     parser.add_argument("--db", type=Path, help="Optional SQLite sandbox path")
     parser.add_argument("--trace", type=Path, help="Write the triage trajectory as JSON")
@@ -64,6 +71,19 @@ def main():
     if args.audit and not re.fullmatch(r"TKT-[A-Za-z0-9_-]+", args.audit):
         parser.error("--audit requires a ticket identifier such as TKT-101")
     try:
+        if args.import_tickets or args.list_tickets or args.preview_batch:
+            if args.preview_batch:
+                report = preview_batch(args.preview_batch, args.db)
+            else:
+                with SandboxEnvironment(db_path=args.db) as env:
+                    report = import_tickets(env, args.import_tickets) if args.import_tickets else ticket_queue(
+                        env, args.status, args.search, args.limit,
+                    )
+            print(json.dumps(report, indent=2))
+            if args.trace:
+                args.trace.parent.mkdir(parents=True, exist_ok=True)
+                args.trace.write_text(json.dumps(report, indent=2), encoding="utf-8")
+            return 1 if args.preview_batch and any(r["trajectory"]["status"] != "SUCCESS" for r in report["results"]) else 0
         if args.preview:
             report = preview_ticket(args.ticket, db_path=args.db)
             print(json.dumps(report, indent=2))

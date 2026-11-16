@@ -10,6 +10,22 @@ A customer-support triage sandbox with a deterministic offline planner, an optio
 
 ## Quick start
 
+## Ticket intake and queue workflow
+
+Import your own tickets (JSON array; customer IDs must already exist):
+
+```bash
+python main.py --import-tickets examples/tickets.json
+python main.py --list-tickets --status OPEN --search invoice --limit 20
+python main.py --preview-batch TKT-DEMO-REFUND TKT-DEMO-INVOICE --trace logs/batch.json
+```
+
+Imports validate every ticket before inserting any rows. Duplicate IDs, unknown customers and unexpected fields reject the entire batch. Existing tickets are never overwritten. Intake events are recorded in the audit history. The example file uses fictional seeded customers.
+
+Queue results include counts by status and searchable ticket summaries. Search treats input as literal text.
+
+Batch preview uses one disposable database copy for all selected tickets in order: later tickets see earlier simulated refunds, so overlapping requests cannot independently consume the same refund balance. It reports each ticket's outcome, proposed actions and aggregate balance changes. Approvals are simulated; the source database is unchanged. Maximum batch size is 100 tickets.
+
 Requires Python 3.11 or later.
 
 ```bash
@@ -87,7 +103,7 @@ Existing databases receive the new tables without resetting their data. Missing/
 
 ## Offline verification
 
-The regression suite contains **127 tests** covering execution boundaries, order-level refund limits, concurrent requests with different keys, exact cents, purchase dates, durable audits, read-only preview, rollback, workflow intent, task scoping, failure handling and evaluator accuracy. Socket connections are blocked during tests.
+The regression suite covers execution boundaries, order-level refund limits, concurrent requests with different keys, exact cents, purchase dates, durable audits, read-only preview, transactional ticket import, queue search, sequential batch preview, rollback, workflow intent, task scoping, failure handling and evaluator accuracy. Socket connections are blocked during tests.
 
 The **35-scenario offline benchmark** checks required tool outcomes and database changes: ticket status, action type, refund amount, balance deltas, order state and unrelated-ticket integrity. Recovery cases inject failures or pre-existing writes instead of merely describing them in prompts.
 

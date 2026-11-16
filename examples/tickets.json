@@ -1,0 +1,18 @@
+[
+  {
+    "ticket_id": "TKT-DEMO-REFUND",
+    "customer_id": "CUST-001",
+    "sender_email": "alice@example.com",
+    "subject": "Damaged order ORD-501",
+    "body": "My keyboard arrived damaged. Please refund ORD-501.",
+    "tags": ["billing", "damage"]
+  },
+  {
+    "ticket_id": "TKT-DEMO-INVOICE",
+    "customer_id": "CUST-002",
+    "sender_email": "bob@example.com",
+    "subject": "Invoice for ORD-601",
+    "body": "Please help me get a copy of my invoice for ORD-601.",
+    "tags": ["invoice"]
+  }
+]
